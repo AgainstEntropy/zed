@@ -77,6 +77,7 @@ pub fn current_platform_executors() -> (ForegroundExecutor, BackgroundExecutor) 
 pub(crate) fn current_platform() -> Rc<dyn Platform> {
     Rc::new(MacPlatform::new())
 }
+
 #[cfg(target_os = "linux")]
 pub(crate) fn current_platform() -> Rc<dyn Platform> {
     match guess_compositor() {
