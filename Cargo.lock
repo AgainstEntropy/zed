@@ -7960,6 +7960,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "release_channel",
+ "remote",
  "rpc",
  "schemars",
  "serde",
