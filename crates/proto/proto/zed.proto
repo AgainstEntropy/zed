@@ -258,17 +258,20 @@ message Envelope {
         LinkedEditingRangeResponse linked_editing_range_response = 210; // current max
 
         // Remote
-        string string = 500;
+        PathResponse path_response = 500;
         ReadFile read_file = 501;
+        ReadFileResponse read_file_response = 513;
         ReadDir read_dir = 502;
-        ReadLink read_link = 503;
-        Canonicalize canonicalize = 504;
-        Stat stat = 505;
-        Metadata metadata = 506;
-        Watch watch = 507;
-        Event event = 508;
-        WriteFile write_file = 509;
-        Pong pong = 510;
+        ReadDirResponse read_dir_response = 503;
+        ReadLink read_link = 504;
+        Canonicalize canonicalize = 505;
+        Stat stat = 506;
+        StatResponse stat_response = 507;
+        Watch watch = 508;
+        WatchResponse watch_response = 509;
+        Event event = 510;
+        WriteFile write_file = 511;
+        Pong pong = 512;
     }
 
     reserved 158 to 161;
@@ -2244,6 +2247,14 @@ message ReadFile {
     string path = 1;
 }
 
+message ReadFileResponse {
+    string content = 1;
+}
+
+message PathResponse {
+    string path = 1;
+}
+
 message WriteFile {
     string path = 1;
     string content = 2;
@@ -2259,6 +2270,10 @@ message ReadDir {
     string path = 1;
 }
 
+message ReadDirResponse {
+    repeated string paths = 1;
+}
+
 message ReadLink {
     string path = 1;
 }
@@ -2272,11 +2287,15 @@ message Watch {
     uint64 latency = 2;
 }
 
+message WatchResponse {
+    uint64 watch_id = 1;
+}
+
 message Stat {
     string path = 1;
 }
 
-message Metadata {
+message StatResponse {
     uint64 inode = 1;
     uint64 mtime = 2;
     bool is_symlink = 3;

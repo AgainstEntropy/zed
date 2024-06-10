@@ -7,22 +7,20 @@ use async_ssh2_lite::{AsyncSession, AsyncSessionStream};
 use collections::HashMap;
 use futures::{
     channel::{mpsc, oneshot},
-    AsyncWriteExt as _, Stream,
+    AsyncWriteExt as _,
 };
 use futures::{select_biased, AsyncReadExt as _, FutureExt as _, StreamExt as _};
 use gpui::BackgroundExecutor;
 use parking_lot::Mutex;
-use rpc::proto::{envelope::Payload, Envelope};
+use rpc::proto::{Envelope, EnvelopedMessage as _, RequestMessage};
 use smol::{fs::unix::MetadataExt, io, Async};
 use std::{
     net::{SocketAddr, TcpStream},
     path::Path,
-    pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering::SeqCst},
-        Arc, Weak,
+        Arc,
     },
-    task,
     time::Instant,
 };
 
@@ -37,13 +35,7 @@ pub struct SshSession {
     spawn_process_tx: mpsc::UnboundedSender<SpawnRequest>,
 }
 
-pub struct SshResponseStream {
-    pub rx: mpsc::UnboundedReceiver<Payload>,
-    id: MessageId,
-    requests: Weak<Requests>,
-}
-
-type Requests = Mutex<HashMap<MessageId, mpsc::UnboundedSender<Payload>>>;
+type Requests = Mutex<HashMap<MessageId, mpsc::UnboundedSender<Envelope>>>;
 
 impl SshSession {
     pub async fn new(
@@ -248,9 +240,9 @@ impl SshSession {
                     while let Some(message) = stdout_rx.next().await {
                         if let Some(request_id) = message.responding_to {
                             let request_id = MessageId(request_id);
-                            if let Some(payload) = message.payload {
+                            if message.payload.is_some() {
                                 if let Some(sender) = requests.lock().get(&request_id) {
-                                    sender.unbounded_send(payload).ok();
+                                    sender.unbounded_send(message).ok();
                                 }
                             } else {
                                 requests.lock().remove(&request_id);
@@ -270,23 +262,16 @@ impl SshSession {
         })
     }
 
-    pub fn send(&self, payload: Payload) -> SshResponseStream {
+    pub async fn request<T: RequestMessage>(&self, payload: T) -> Result<T::Response> {
         let id = self.next_message_id.fetch_add(1, SeqCst);
-        let (tx, rx) = mpsc::unbounded();
+        let (tx, mut rx) = mpsc::unbounded();
         self.requests.lock().insert(MessageId(id), tx);
         self.stdin_tx
-            .unbounded_send(Envelope {
-                original_sender_id: None,
-                id,
-                responding_to: None,
-                payload: Some(payload),
-            })
+            .unbounded_send(payload.into_envelope(id, None, None))
             .ok();
-        SshResponseStream {
-            id: MessageId(id),
-            requests: Arc::downgrade(&self.requests),
-            rx,
-        }
+        let response = rx.next().await.ok_or_else(|| anyhow!("connection lost"))?;
+        T::Response::from_envelope(response)
+            .ok_or_else(|| anyhow!("received a response of the wrong type"))
     }
 
     pub async fn spawn_process(&self, command: String) -> SshChildProcess {
@@ -311,33 +296,6 @@ pub struct SshChildProcess {
     pub stdout: PipeReader,
     pub stderr: PipeReader,
     pub exit: oneshot::Receiver<i32>,
-}
-
-impl SshResponseStream {
-    pub async fn one(mut self) -> Result<Payload> {
-        self.next()
-            .await
-            .ok_or_else(|| anyhow!("stream ended unexpectedly"))
-    }
-}
-
-impl Stream for SshResponseStream {
-    type Item = Payload;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> task::Poll<Option<Self::Item>> {
-        Pin::new(&mut self.rx).poll_next(cx)
-    }
-}
-
-impl Drop for SshResponseStream {
-    fn drop(&mut self) {
-        if let Some(requests) = self.requests.upgrade() {
-            requests.lock().remove(&self.id);
-        }
-    }
 }
 
 async fn ensure_server_binary<S: AsyncSessionStream + Send + Sync + 'static>(

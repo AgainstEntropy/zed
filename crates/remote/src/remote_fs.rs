@@ -5,7 +5,7 @@ use crate::SshSession;
 use anyhow::{anyhow, Result};
 use async_tar::Archive;
 use fs::{CopyOptions, CreateOptions, Fs, Metadata, RemoveOptions, RenameOptions, Watcher};
-use futures::{AsyncRead, Stream};
+use futures::{stream, AsyncRead, Stream};
 use git::repository::GitRepository;
 use rpc::proto::{self, envelope::Payload};
 use smol::stream::StreamExt;
@@ -89,18 +89,13 @@ impl Fs for RemoteFs {
     }
 
     async fn load(&self, path: &Path) -> Result<String> {
-        let response = self
+        Ok(self
             .session
-            .send(Payload::ReadFile(proto::ReadFile {
+            .request(proto::ReadFile {
                 path: path.to_string_lossy().to_string(),
-            }))
-            .one()
-            .await?;
-        if let Payload::String(response) = response {
-            Ok(response)
-        } else {
-            Err(anyhow!("unexpected response"))
-        }
+            })
+            .await?
+            .content)
     }
 
     async fn atomic_write(&self, path: PathBuf, data: String) -> Result<()> {
@@ -110,36 +105,27 @@ impl Fs for RemoteFs {
     async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
         let response = self
             .session
-            .send(Payload::WriteFile(proto::WriteFile {
+            .request(proto::WriteFile {
                 path: path.to_string_lossy().to_string(),
                 content: text.to_string(),
                 line_ending: match line_ending {
                     LineEnding::Unix => proto::write_file::LineEnding::Unix as i32,
                     LineEnding::Windows => proto::write_file::LineEnding::Windows as i32,
                 },
-            }))
-            .next()
-            .await;
-        match response {
-            Some(Payload::Error(error)) => Err(anyhow!("{}", error.message)),
-            Some(_) => Err(anyhow!("unexpected response")),
-            None => Ok(()),
-        }
+            })
+            .await?;
+        Ok(())
     }
 
     async fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
-        let response = self
+        Ok(self
             .session
-            .send(Payload::Canonicalize(proto::Canonicalize {
+            .request(proto::Canonicalize {
                 path: path.to_string_lossy().to_string(),
-            }))
-            .one()
-            .await?;
-        if let Payload::String(response) = response {
-            Ok(response.into())
-        } else {
-            Err(anyhow!("unexpected response"))
-        }
+            })
+            .await?
+            .path
+            .into())
     }
 
     async fn is_file(&self, path: &Path) -> bool {
@@ -151,54 +137,42 @@ impl Fs for RemoteFs {
     }
 
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>> {
-        let response = self
+        let metadata = self
             .session
-            .send(Payload::Stat(proto::Stat {
+            .request(proto::Stat {
                 path: path.to_string_lossy().to_string(),
-            }))
-            .next()
-            .await;
-        match response {
-            Some(Payload::Metadata(metadata)) => Ok(Some(Metadata {
-                inode: metadata.inode,
-                mtime: SystemTime::UNIX_EPOCH + Duration::from_millis(metadata.mtime),
-                is_symlink: metadata.is_symlink,
-                is_dir: metadata.is_dir,
-            })),
-            Some(Payload::Error(error)) => Err(anyhow!("{}", error.message)),
-            _ => Ok(None),
-        }
+            })
+            .await?;
+        Ok(Some(Metadata {
+            inode: metadata.inode,
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_millis(metadata.mtime),
+            is_symlink: metadata.is_symlink,
+            is_dir: metadata.is_dir,
+        }))
     }
 
     async fn read_link(&self, path: &Path) -> Result<PathBuf> {
-        let response = self
+        Ok(self
             .session
-            .send(Payload::ReadLink(proto::ReadLink {
+            .request(proto::ReadLink {
                 path: path.to_string_lossy().to_string(),
-            }))
-            .one()
-            .await?;
-        if let Payload::String(response) = response {
-            Ok(response.into())
-        } else {
-            Err(anyhow!("unexpected response"))
-        }
+            })
+            .await?
+            .path
+            .into())
     }
 
     async fn read_dir(
         &self,
         path: &Path,
     ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<PathBuf>>>>> {
-        let stream = self.session.send(Payload::ReadDir(proto::ReadDir {
-            path: path.to_string_lossy().to_string(),
-        }));
-        Ok(stream
-            .filter_map(|item| match item {
-                Payload::String(path) => Some(Ok(PathBuf::from(path))),
-                Payload::Error(error) => Some(Err(anyhow!("{}", error.message))),
-                _ => None,
+        let response = self
+            .session
+            .request(proto::ReadDir {
+                path: path.to_string_lossy().to_string(),
             })
-            .boxed())
+            .await?;
+        Ok(stream::iter(response.paths.into_iter().map(|path| Ok(path.into()))).boxed())
     }
 
     async fn watch(
@@ -209,21 +183,7 @@ impl Fs for RemoteFs {
         Pin<Box<dyn Send + Stream<Item = Vec<PathBuf>>>>,
         Arc<(dyn Watcher + 'static)>,
     ) {
-        let stream = self.session.send(Payload::Watch(proto::Watch {
-            path: path.to_string_lossy().to_string(),
-            latency: latency.as_millis() as u64,
-        }));
-        (
-            stream
-                .filter_map(|item| match item {
-                    Payload::Event(event) => {
-                        Some(event.paths.into_iter().map(PathBuf::from).collect())
-                    }
-                    _ => None,
-                })
-                .boxed(),
-            Arc::new(RemoteWatcher {}),
-        )
+        (stream::pending().boxed(), Arc::new(RemoteWatcher {}))
     }
 
     fn open_repo(&self, dotgit_path: &Path) -> Option<Arc<dyn GitRepository>> {

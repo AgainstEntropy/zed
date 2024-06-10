@@ -11,7 +11,6 @@ use collections::HashMap;
 pub use prost::Message;
 use serde::Serialize;
 use std::any::{Any, TypeId};
-use std::time::Instant;
 use std::{
     cmp,
     fmt::Debug,
@@ -337,7 +336,18 @@ messages!(
     (OpenNewBuffer, Foreground),
     (RestartLanguageServers, Foreground),
     (LinkedEditingRange, Background),
-    (LinkedEditingRangeResponse, Background)
+    (LinkedEditingRangeResponse, Background),
+    // Remote development
+    (WriteFile, Foreground),
+    (ReadFile, Foreground),
+    (ReadFileResponse, Foreground),
+    (Canonicalize, Foreground),
+    (ReadLink, Foreground),
+    (ReadDir, Foreground),
+    (ReadDirResponse, Foreground),
+    (PathResponse, Foreground),
+    (Stat, Foreground),
+    (StatResponse, Foreground),
 );
 
 request_messages!(
@@ -449,7 +459,14 @@ request_messages!(
     (DeleteDevServerProject, Ack),
     (RegenerateDevServerToken, RegenerateDevServerTokenResponse),
     (RenameDevServer, Ack),
-    (RestartLanguageServers, Ack)
+    (RestartLanguageServers, Ack),
+    // Remote development
+    (ReadFile, ReadFileResponse),
+    (WriteFile, Ack),
+    (Canonicalize, PathResponse),
+    (ReadLink, PathResponse),
+    (ReadDir, ReadDirResponse),
+    (Stat, StatResponse),
 );
 
 entity_messages!(

@@ -1,15 +1,27 @@
 use anyhow::{anyhow, Result};
+use collections::HashMap;
 use fs::{Fs, RealFs};
-use futures::channel::mpsc::{self, UnboundedSender};
+use futures::{
+    channel::mpsc::{self, UnboundedSender},
+    future::BoxFuture,
+    Future, FutureExt as _,
+};
 use gpui::BackgroundExecutor;
 use remote::protocol::{read_message, write_message, MessageId};
-use rpc::proto::{self, envelope::Payload, Envelope, Error};
+use rpc::{
+    proto::{
+        self, AnyTypedEnvelope, Envelope, EnvelopedMessage as _, Error, PeerId, RequestMessage,
+    },
+    TypedEnvelope,
+};
 use smol::{io::AsyncWriteExt, stream::StreamExt, Async};
 use std::{
+    any::TypeId,
     env, io,
+    marker::PhantomData,
     path::Path,
-    sync::Arc,
-    time::{Duration, UNIX_EPOCH},
+    sync::{Arc, Once},
+    time::{Instant, UNIX_EPOCH},
 };
 use text::LineEnding;
 use util::ResultExt;
@@ -17,15 +29,11 @@ use util::ResultExt;
 fn main() {
     env::set_var("RUST_BACKTRACE", "1");
 
-    let (_, background) = gpui::current_platform_executors();
+    let (foreground, background) = gpui::current_platform_executors();
     let (request_tx, mut request_rx) = mpsc::unbounded();
     let (response_tx, mut response_rx) = mpsc::unbounded();
 
-    let mut server = Server {
-        fs: RealFs::new(Default::default(), None),
-        executor: background.clone(),
-    };
-
+    let mut server = Server::new(background.clone());
     let mut stdin = Async::new(io::stdin()).unwrap();
     let mut stdout = Async::new(io::stdout()).unwrap();
 
@@ -40,6 +48,7 @@ fn main() {
 
     let stdin_task = background.spawn(async move {
         let mut input_buffer = Vec::new();
+        let connection_id = PeerId { owner_id: 0, id: 0 };
         loop {
             let message = match read_message(&mut stdin, &mut input_buffer).await {
                 Ok(message) => message,
@@ -48,20 +57,22 @@ fn main() {
                     break;
                 }
             };
-            request_tx.unbounded_send(message).ok();
+            if let Some(envelope) =
+                proto::build_typed_envelope(connection_id, Instant::now(), message)
+            {
+                request_tx.unbounded_send(envelope).ok();
+            }
         }
     });
 
-    let request_task = background.spawn(async move {
+    let request_task = foreground.spawn(async move {
         while let Some(request) = request_rx.next().await {
-            if let Some(payload) = request.payload {
-                let response = Response(Arc::new(ResponseInner {
-                    id: MessageId(request.id),
-                    tx: response_tx.clone(),
-                }));
-                if let Err(error) = server.handle_message(payload, response.clone()).await {
-                    response.send_error(error);
-                }
+            let response = Arc::new(ResponseInner {
+                id: MessageId(request.message_id()),
+                tx: response_tx.clone(),
+            });
+            if let Err(error) = server.handle_message(request, response.clone()).await {
+                response.send_error(error);
             }
         }
     });
@@ -73,13 +84,27 @@ fn main() {
     });
 }
 
+#[derive(Clone)]
 struct Server {
-    fs: RealFs,
+    fs: Arc<RealFs>,
+    #[allow(unused)]
     executor: BackgroundExecutor,
+    handlers: &'static Handlers,
 }
 
+struct Handlers(HashMap<TypeId, MessageHandler>);
+
+static mut HANDLERS: Option<Handlers> = None;
+static INIT_HANDLERS: Once = Once::new();
+
+type MessageHandler = Box<
+    dyn Send
+        + Sync
+        + Fn(Server, Box<dyn AnyTypedEnvelope>, Arc<ResponseInner>) -> BoxFuture<'static, Result<()>>,
+>;
+
 #[derive(Clone)]
-struct Response(Arc<ResponseInner>);
+struct Response<T: RequestMessage>(Arc<ResponseInner>, PhantomData<T>);
 
 struct ResponseInner {
     id: MessageId,
@@ -87,90 +112,123 @@ struct ResponseInner {
 }
 
 impl Server {
-    async fn handle_message(&mut self, message: Payload, response: Response) -> Result<()> {
-        match message {
-            Payload::Ping(_) => self.ping(response),
-            Payload::ReadFile(request) => self.read_file(request, response).await,
-            Payload::ReadDir(request) => self.read_dir(request, response).await,
-            Payload::ReadLink(request) => self.read_link(request, response).await,
-            Payload::Canonicalize(request) => self.canonicalize(request, response).await,
-            Payload::Stat(request) => self.stat(request, response).await,
-            Payload::Watch(request) => self.watch(request, response).await,
-            Payload::WriteFile(request) => self.write_file(request, response).await,
-            _ => {
-                response.send_error(anyhow!("unhandled request type"));
-                Ok(())
-            }
+    pub fn new(executor: BackgroundExecutor) -> Self {
+        let handlers = unsafe {
+            INIT_HANDLERS.call_once(|| HANDLERS = Some(Self::init()));
+            HANDLERS.as_ref().unwrap()
+        };
+
+        Self {
+            fs: Arc::new(RealFs::new(Default::default(), None)),
+            executor,
+            handlers,
         }
     }
 
-    fn ping(&self, response: Response) -> Result<()> {
-        response.send(Payload::Pong(proto::Pong {}));
+    fn init() -> Handlers {
+        Handlers(HashMap::default())
+            .add(Self::ping)
+            .add(Self::write_file)
+            .add(Self::stat)
+            .add(Self::canonicalize)
+            .add(Self::read_link)
+            .add(Self::read_dir)
+            .add(Self::read_file)
+    }
+
+    async fn handle_message(
+        &mut self,
+        message: Box<dyn AnyTypedEnvelope>,
+        response: Arc<ResponseInner>,
+    ) -> Result<()> {
+        if let Some(handler) = self.handlers.0.get(&message.payload_type_id()) {
+            handler(self.clone(), message, response).await
+        } else {
+            response.send_error(anyhow!("unhandled request type"));
+            Ok(())
+        }
+    }
+
+    async fn ping(self, _: proto::Ping, response: Response<proto::Ping>) -> Result<()> {
+        response.send(proto::Ack {});
         Ok(())
     }
 
-    async fn read_file(&self, request: proto::ReadFile, response: Response) -> Result<()> {
+    async fn read_file(
+        self,
+        request: proto::ReadFile,
+        response: Response<proto::ReadFile>,
+    ) -> Result<()> {
         let content = self.fs.load(Path::new(&request.path)).await?;
-        response.send(Payload::String(content));
+        response.send(proto::ReadFileResponse { content });
         Ok(())
     }
 
-    async fn read_link(&self, request: proto::ReadLink, response: Response) -> Result<()> {
+    async fn read_link(
+        self,
+        request: proto::ReadLink,
+        response: Response<proto::ReadLink>,
+    ) -> Result<()> {
         let content = self.fs.read_link(Path::new(&request.path)).await?;
-        response.send(Payload::String(content.to_string_lossy().to_string()));
+        response.send(proto::PathResponse {
+            path: content.to_string_lossy().to_string(),
+        });
         Ok(())
     }
 
-    async fn canonicalize(&self, request: proto::Canonicalize, response: Response) -> Result<()> {
+    async fn canonicalize(
+        self,
+        request: proto::Canonicalize,
+        response: Response<proto::Canonicalize>,
+    ) -> Result<()> {
         let content = self.fs.canonicalize(Path::new(&request.path)).await?;
-        response.send(Payload::String(content.to_string_lossy().to_string()));
+        response.send(proto::PathResponse {
+            path: content.to_string_lossy().to_string(),
+        });
         Ok(())
     }
 
-    async fn read_dir(&self, request: proto::ReadDir, response: Response) -> Result<()> {
+    async fn read_dir(
+        self,
+        request: proto::ReadDir,
+        response: Response<proto::ReadDir>,
+    ) -> Result<()> {
         let mut stream = self.fs.read_dir(Path::new(&request.path)).await?;
-        self.executor
-            .spawn(async move {
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(path) => {
-                            response.send(Payload::String(path.to_string_lossy().to_string()))
-                        }
-                        Err(error) => response.send_error(error),
-                    }
-                }
-            })
-            .detach();
+        let mut paths = Vec::new();
+        while let Some(item) = stream.next().await {
+            paths.push(item?.to_string_lossy().to_string());
+        }
+        response.send(proto::ReadDirResponse { paths });
         Ok(())
     }
 
-    async fn watch(&self, request: proto::Watch, response: Response) -> Result<()> {
-        let (mut stream, _) = self
-            .fs
-            .watch(
-                Path::new(&request.path),
-                Duration::from_millis(request.latency),
-            )
-            .await;
-        self.executor
-            .spawn(async move {
-                while let Some(event) = stream.next().await {
-                    response.send(Payload::Event(proto::Event {
-                        paths: event
-                            .into_iter()
-                            .map(|path| path.to_string_lossy().to_string())
-                            .collect(),
-                    }))
-                }
-            })
-            .detach();
-        Ok(())
-    }
+    // async fn watch(&self, request: proto::Watch, response: Response) -> Result<()> {
+    //     let (mut stream, _) = self
+    //         .fs
+    //         .watch(
+    //             Path::new(&request.path),
+    //             Duration::from_millis(request.latency),
+    //         )
+    //         .await;
+    //     self.executor
+    //         .spawn(async move {
+    //             while let Some(event) = stream.next().await {
+    //                 response.send(Payload::Event(proto::Event {
+    //                     paths: event
+    //                         .into_iter()
+    //                         .map(|path| path.to_string_lossy().to_string())
+    //                         .collect(),
+    //                 }))
+    //             }
+    //         })
+    //         .detach();
+    //     Ok(())
+    // }
 
-    async fn stat(&self, request: proto::Stat, response: Response) -> Result<()> {
+    async fn stat(self, request: proto::Stat, response: Response<proto::Stat>) -> Result<()> {
         let metadata = self.fs.metadata(Path::new(&request.path)).await?;
         if let Some(metadata) = metadata {
-            let proto_metadata = proto::Metadata {
+            response.send(proto::StatResponse {
                 is_dir: metadata.is_dir,
                 is_symlink: metadata.is_symlink,
                 mtime: metadata
@@ -179,13 +237,16 @@ impl Server {
                     .unwrap()
                     .as_millis() as u64,
                 inode: metadata.inode,
-            };
-            response.send(Payload::Metadata(proto_metadata));
+            });
         }
         Ok(())
     }
 
-    async fn write_file(&self, request: proto::WriteFile, _: Response) -> Result<()> {
+    async fn write_file(
+        self,
+        request: proto::WriteFile,
+        _: Response<proto::WriteFile>,
+    ) -> Result<()> {
         self.fs
             .save(
                 Path::new(&request.path),
@@ -200,25 +261,55 @@ impl Server {
     }
 }
 
-impl Response {
-    fn send(&self, payload: Payload) {
+impl Handlers {
+    fn add<F, Fut, M>(mut self, handler: F) -> Self
+    where
+        F: 'static + Send + Sync + Fn(Server, M, Response<M>) -> Fut,
+        Fut: 'static + Send + Future<Output = Result<()>>,
+        M: RequestMessage,
+    {
+        self.0.insert(
+            TypeId::of::<M>(),
+            Box::new(move |server, envelope, response| {
+                let envelope = *envelope.into_any().downcast::<TypedEnvelope<M>>().unwrap();
+                handler(
+                    server,
+                    envelope.payload,
+                    Response::<M>(response, PhantomData),
+                )
+                .boxed()
+            }),
+        );
+        self
+    }
+}
+
+impl<T: RequestMessage> Response<T> {
+    fn send(&self, payload: T::Response) {
         self.0
-            .tx
-            .unbounded_send(Envelope {
-                original_sender_id: None,
-                id: 0,
-                payload: Some(payload),
-                responding_to: Some(self.0.id.0),
-            })
-            .ok();
+            .send(payload.into_envelope(0, Some(self.0.id.0), None))
+    }
+
+    #[allow(unused)]
+    fn send_error(&self, error: anyhow::Error) {
+        self.0.send_error(error)
+    }
+}
+
+impl ResponseInner {
+    fn send(&self, envelope: Envelope) {
+        self.tx.unbounded_send(envelope).ok();
     }
 
     fn send_error(&self, error: anyhow::Error) {
-        self.send(Payload::Error(Error {
-            code: 0,
-            tags: Vec::new(),
-            message: error.to_string(),
-        }))
+        self.send(
+            Error {
+                code: 0,
+                tags: Vec::new(),
+                message: error.to_string(),
+            }
+            .into_envelope(0, Some(self.id.0), None),
+        )
     }
 }
 
