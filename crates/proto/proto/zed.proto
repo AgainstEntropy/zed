@@ -272,6 +272,8 @@ message Envelope {
         Event event = 510;
         WriteFile write_file = 511;
         Pong pong = 512;
+        AddWorktree add_worktree = 514;
+        AddWorktreeResponse add_worktree_response = 515;
     }
 
     reserved 158 to 161;
@@ -2304,4 +2306,12 @@ message StatResponse {
 
 message Event {
     repeated string paths = 1;
+}
+
+message AddWorktree {
+    string path = 1;
+}
+
+message AddWorktreeResponse {
+    uint64 worktree_id = 1;
 }

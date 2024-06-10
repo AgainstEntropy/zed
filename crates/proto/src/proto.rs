@@ -348,6 +348,8 @@ messages!(
     (PathResponse, Foreground),
     (Stat, Foreground),
     (StatResponse, Foreground),
+    (AddWorktree, Foreground),
+    (AddWorktreeResponse, Foreground),
 );
 
 request_messages!(
@@ -467,6 +469,7 @@ request_messages!(
     (ReadLink, PathResponse),
     (ReadDir, ReadDirResponse),
     (Stat, StatResponse),
+    (AddWorktree, AddWorktreeResponse),
 );
 
 entity_messages!(

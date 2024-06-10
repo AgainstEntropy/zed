@@ -8507,7 +8507,24 @@ dependencies = [
  "rpc",
  "smol",
  "text",
- "util",
+]
+
+[[package]]
+name = "remote_server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "env_logger",
+ "fs",
+ "futures 0.3.28",
+ "gpui",
+ "log",
+ "remote",
+ "rpc",
+ "smol",
+ "text",
+ "worktree",
 ]
 
 [[package]]

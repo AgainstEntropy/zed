@@ -78,6 +78,7 @@ members = [
     "crates/refineable/derive_refineable",
     "crates/release_channel",
     "crates/remote",
+    "crates/remote_server",
     "crates/dev_server_projects",
     "crates/repl",
     "crates/rich_text",

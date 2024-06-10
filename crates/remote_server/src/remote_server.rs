@@ -1,100 +1,33 @@
 use anyhow::{anyhow, Result};
 use collections::HashMap;
 use fs::{Fs, RealFs};
-use futures::{
-    channel::mpsc::{self, UnboundedSender},
-    future::LocalBoxFuture,
-    Future, FutureExt as _,
-};
-use gpui::{AsyncAppContext, BackgroundExecutor};
-use remote::protocol::{read_message, write_message, MessageId};
+use futures::{channel::mpsc::UnboundedSender, future::LocalBoxFuture, Future, FutureExt as _};
+use gpui::{AsyncAppContext, Model};
+use remote::protocol::MessageId;
 use rpc::{
     proto::{
         self, AnyTypedEnvelope, Envelope, EnvelopedMessage as _, Error, PeerId, RequestMessage,
     },
+    proto::{self, AnyTypedEnvelope, Envelope, EnvelopedMessage as _, Error, RequestMessage},
     TypedEnvelope,
 };
-use smol::{io::AsyncWriteExt, stream::StreamExt, Async};
+use smol::stream::StreamExt;
 use std::{
     any::TypeId,
-    env, io,
     marker::PhantomData,
     path::Path,
     sync::{Arc, Once},
-    time::{Instant, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 use text::LineEnding;
-
-fn main() {
-    env::set_var("RUST_BACKTRACE", "1");
-
-    let app = gpui::App::new();
-    let background = app.background_executor();
-
-    let (request_tx, mut request_rx) = mpsc::unbounded();
-    let (response_tx, mut response_rx) = mpsc::unbounded();
-
-    let mut server = Server::new(background.clone());
-    let mut stdin = Async::new(io::stdin()).unwrap();
-    let mut stdout = Async::new(io::stdout()).unwrap();
-
-    background
-        .spawn(async move {
-            let mut output_buffer = Vec::new();
-            while let Some(response) = response_rx.next().await {
-                write_message(&mut stdout, &mut output_buffer, response).await?;
-                stdout.flush().await?;
-            }
-            anyhow::Ok(())
-        })
-        .detach();
-
-    background
-        .spawn(async move {
-            let mut input_buffer = Vec::new();
-            let connection_id = PeerId { owner_id: 0, id: 0 };
-            loop {
-                let message = match read_message(&mut stdin, &mut input_buffer).await {
-                    Ok(message) => message,
-                    Err(error) => {
-                        eprintln!("error reading message: {:?}", error);
-                        break;
-                    }
-                };
-                if let Some(envelope) =
-                    proto::build_typed_envelope(connection_id, Instant::now(), message)
-                {
-                    request_tx.unbounded_send(envelope).ok();
-                }
-            }
-        })
-        .detach();
-
-    app.headless().run(|cx| {
-        cx.spawn(move |cx| async move {
-            while let Some(request) = request_rx.next().await {
-                let response = Arc::new(ResponseInner {
-                    id: MessageId(request.message_id()),
-                    tx: response_tx.clone(),
-                });
-                if let Err(error) = server
-                    .handle_message(request, response.clone(), cx.clone())
-                    .await
-                {
-                    response.send_error(error);
-                }
-            }
-        })
-        .detach();
-    });
-}
+use worktree::Worktree;
 
 #[derive(Clone)]
-struct Server {
+pub struct Server {
     fs: Arc<RealFs>,
-    #[allow(unused)]
-    executor: BackgroundExecutor,
     handlers: &'static Handlers,
+    #[allow(unused)]
+    worktrees: Vec<Model<Worktree>>,
 }
 
 struct Handlers(HashMap<TypeId, MessageHandler>);
@@ -114,7 +47,7 @@ type MessageHandler = Box<
 >;
 
 #[derive(Clone)]
-struct Response<T: RequestMessage>(Arc<ResponseInner>, PhantomData<T>);
+struct Response<T>(Arc<ResponseInner>, PhantomData<T>);
 
 struct ResponseInner {
     id: MessageId,
@@ -122,7 +55,7 @@ struct ResponseInner {
 }
 
 impl Server {
-    pub fn new(executor: BackgroundExecutor) -> Self {
+    pub fn new() -> Self {
         let handlers = unsafe {
             INIT_HANDLERS.call_once(|| HANDLERS = Some(Self::init()));
             HANDLERS.as_ref().unwrap()
@@ -130,8 +63,8 @@ impl Server {
 
         Self {
             fs: Arc::new(RealFs::new(Default::default(), None)),
-            executor,
             handlers,
+            worktrees: Vec::new(),
         }
     }
 
@@ -144,24 +77,40 @@ impl Server {
             .add(Self::read_link)
             .add(Self::read_dir)
             .add(Self::read_file)
+            .add(Self::add_worktree)
     }
 
-    async fn handle_message(
+    pub async fn handle_message(
         &mut self,
         message: Box<dyn AnyTypedEnvelope>,
-        response: Arc<ResponseInner>,
+        response: UnboundedSender<Envelope>,
         cx: AsyncAppContext,
-    ) -> Result<()> {
+    ) {
+        let response = Arc::new(ResponseInner {
+            id: MessageId(message.message_id()),
+            tx: response,
+        });
         if let Some(handler) = self.handlers.0.get(&message.payload_type_id()) {
             let type_name = message.payload_type_name();
             eprintln!("received {type_name}");
-            let result = handler(self.clone(), message, response, cx).await;
+            let result = handler(self.clone(), message, response.clone(), cx).await;
             eprintln!("responded {type_name}");
-            result
+            if let Err(error) = result {
+                response.send_error(error);
+            }
         } else {
             response.send_error(anyhow!("unhandled request type"));
-            Ok(())
         }
+    }
+
+    async fn add_worktree(
+        self,
+        _: proto::AddWorktree,
+        _response: Response<proto::AddWorktree>,
+        _cx: AsyncAppContext,
+    ) -> Result<()> {
+        //
+        Ok(())
     }
 
     async fn ping(
