@@ -30,12 +30,12 @@ const SERVER_BINARY_REMOTE_PATH: &str = "./.zed_remote_server";
 #[derive(Clone)]
 pub struct SshSession {
     next_message_id: Arc<AtomicU32>,
-    requests: Arc<Requests>,
-    stdin_tx: mpsc::UnboundedSender<Envelope>,
+    response_channels: Arc<ResponseChannels>,
+    outgoing_tx: mpsc::UnboundedSender<Envelope>,
     spawn_process_tx: mpsc::UnboundedSender<SpawnRequest>,
 }
 
-type Requests = Mutex<HashMap<MessageId, mpsc::UnboundedSender<Envelope>>>;
+type ResponseChannels = Mutex<HashMap<MessageId, mpsc::UnboundedSender<Envelope>>>;
 
 impl SshSession {
     pub async fn new(
@@ -45,9 +45,9 @@ impl SshSession {
         executor: BackgroundExecutor,
     ) -> Result<Self> {
         let (spawn_process_tx, mut spawn_process_rx) = mpsc::unbounded::<SpawnRequest>();
-        let (stdin_tx, mut stdin_rx) = mpsc::unbounded::<Envelope>();
-        let (stdout_tx, mut stdout_rx) = mpsc::unbounded::<Envelope>();
-        let requests = Arc::new(Requests::default());
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let (incoming_tx, mut incoming_rx) = mpsc::unbounded::<Envelope>();
+        let response_channels = Arc::new(ResponseChannels::default());
 
         let stream = Async::<TcpStream>::connect(address)
             .await
@@ -80,13 +80,13 @@ impl SshSession {
                     stderr_buffer.resize(stderr_offset + 1024, 0);
 
                     select_biased! {
-                        input = stdin_rx.next().fuse() => {
-                            let Some(input) = input else {
+                        outgoing = outgoing_rx.next().fuse() => {
+                            let Some(outgoing) = outgoing else {
                                 return anyhow::Ok(());
                             };
 
-                            log::info!("send message: {input:?}");
-                            write_message(&mut channel, &mut stdin_buffer, input).await?;
+                            log::info!("send message: {outgoing:?}");
+                            write_message(&mut channel, &mut stdin_buffer, outgoing).await?;
                         }
 
                         request = spawn_process_rx.next().fuse() => {
@@ -196,7 +196,7 @@ impl SshSession {
                                     match read_message_with_len(&mut channel, &mut stdout_buffer, message_len).await {
                                         Ok(envelope) => {
                                             log::info!("receive message: {envelope:?}");
-                                            stdout_tx.unbounded_send(envelope).ok();
+                                            incoming_tx.unbounded_send(envelope).ok();
                                         }
                                         Err(error) => {
                                             log::error!("error decoding message {error:?}");
@@ -235,17 +235,17 @@ impl SshSession {
 
         executor
             .spawn({
-                let requests = requests.clone();
+                let response_channels = response_channels.clone();
                 async move {
-                    while let Some(message) = stdout_rx.next().await {
-                        if let Some(request_id) = message.responding_to {
+                    while let Some(incoming) = incoming_rx.next().await {
+                        if let Some(request_id) = incoming.responding_to {
                             let request_id = MessageId(request_id);
-                            if message.payload.is_some() {
-                                if let Some(sender) = requests.lock().get(&request_id) {
-                                    sender.unbounded_send(message).ok();
+                            if incoming.payload.is_some() {
+                                if let Some(sender) = response_channels.lock().get(&request_id) {
+                                    sender.unbounded_send(incoming).ok();
                                 }
                             } else {
-                                requests.lock().remove(&request_id);
+                                response_channels.lock().remove(&request_id);
                             }
                         }
                     }
@@ -256,8 +256,8 @@ impl SshSession {
 
         Ok(Self {
             next_message_id: Arc::new(AtomicU32::new(0)),
-            requests,
-            stdin_tx,
+            response_channels,
+            outgoing_tx,
             spawn_process_tx,
         })
     }
@@ -265,8 +265,8 @@ impl SshSession {
     pub async fn request<T: RequestMessage>(&self, payload: T) -> Result<T::Response> {
         let id = self.next_message_id.fetch_add(1, SeqCst);
         let (tx, mut rx) = mpsc::unbounded();
-        self.requests.lock().insert(MessageId(id), tx);
-        self.stdin_tx
+        self.response_channels.lock().insert(MessageId(id), tx);
+        self.outgoing_tx
             .unbounded_send(payload.into_envelope(id, None, None))
             .ok();
         let response = rx.next().await.ok_or_else(|| anyhow!("connection lost"))?;

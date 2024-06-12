@@ -15,8 +15,8 @@ fn main() {
     let app = gpui::App::new();
     let background = app.background_executor();
 
-    let (request_tx, mut request_rx) = mpsc::unbounded();
-    let (response_tx, mut response_rx) = mpsc::unbounded();
+    let (incoming_tx, mut incoming_rx) = mpsc::unbounded();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded();
 
     let mut stdin = Async::new(io::stdin()).unwrap();
     let mut stdout = Async::new(io::stdout()).unwrap();
@@ -24,8 +24,8 @@ fn main() {
     background
         .spawn(async move {
             let mut output_buffer = Vec::new();
-            while let Some(response) = response_rx.next().await {
-                write_message(&mut stdout, &mut output_buffer, response).await?;
+            while let Some(message) = outgoing_rx.next().await {
+                write_message(&mut stdout, &mut output_buffer, message).await?;
                 stdout.flush().await?;
             }
             anyhow::Ok(())
@@ -47,7 +47,7 @@ fn main() {
                 if let Some(envelope) =
                     proto::build_typed_envelope(connection_id, Instant::now(), message)
                 {
-                    request_tx.unbounded_send(envelope).ok();
+                    incoming_tx.unbounded_send(envelope).ok();
                 }
             }
         })
@@ -56,9 +56,9 @@ fn main() {
     app.headless().run(|cx| {
         let mut server = Server::new(cx);
         cx.spawn(move |cx| async move {
-            while let Some(request) = request_rx.next().await {
+            while let Some(message) = incoming_rx.next().await {
                 server
-                    .handle_message(request, response_tx.clone(), cx.clone())
+                    .handle_message(message, outgoing_tx.clone(), cx.clone())
                     .await;
             }
         })
