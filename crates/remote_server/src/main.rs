@@ -54,7 +54,7 @@ fn main() {
         .detach();
 
     app.headless().run(|cx| {
-        let mut server = Server::new();
+        let mut server = Server::new(cx);
         cx.spawn(move |cx| async move {
             while let Some(request) = request_rx.next().await {
                 server

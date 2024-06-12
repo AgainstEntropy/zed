@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use collections::HashMap;
 use fs::{Fs, RealFs};
 use futures::{channel::mpsc::UnboundedSender, future::LocalBoxFuture, Future, FutureExt as _};
-use gpui::{AsyncAppContext, Model};
+use gpui::{AppContext, AsyncAppContext, Context, Model};
 use remote::protocol::MessageId;
 use rpc::{
     proto::{
@@ -16,7 +16,7 @@ use std::{
     any::TypeId,
     marker::PhantomData,
     path::Path,
-    sync::{Arc, Once},
+    sync::{atomic::AtomicUsize, Arc, Once},
     time::UNIX_EPOCH,
 };
 use text::LineEnding;
@@ -26,8 +26,12 @@ use worktree::Worktree;
 pub struct Server {
     fs: Arc<RealFs>,
     handlers: &'static Handlers,
-    #[allow(unused)]
+    state: Model<ServerState>,
+}
+
+struct ServerState {
     worktrees: Vec<Model<Worktree>>,
+    next_entry_id: Arc<AtomicUsize>,
 }
 
 struct Handlers(HashMap<TypeId, MessageHandler>);
@@ -55,7 +59,7 @@ struct ResponseInner {
 }
 
 impl Server {
-    pub fn new() -> Self {
+    pub fn new(cx: &mut AppContext) -> Self {
         let handlers = unsafe {
             INIT_HANDLERS.call_once(|| HANDLERS = Some(Self::init()));
             HANDLERS.as_ref().unwrap()
@@ -64,7 +68,10 @@ impl Server {
         Self {
             fs: Arc::new(RealFs::new(Default::default(), None)),
             handlers,
-            worktrees: Vec::new(),
+            state: cx.new_model(|_| ServerState {
+                worktrees: Vec::new(),
+                next_entry_id: Default::default(),
+            }),
         }
     }
 
@@ -105,11 +112,27 @@ impl Server {
 
     async fn add_worktree(
         self,
-        _: proto::AddWorktree,
-        _response: Response<proto::AddWorktree>,
-        _cx: AsyncAppContext,
+        message: proto::AddWorktree,
+        response: Response<proto::AddWorktree>,
+        mut cx: AsyncAppContext,
     ) -> Result<()> {
-        //
+        let next_entry_id = self
+            .state
+            .read_with(&mut cx, |state, _| state.next_entry_id.clone())?;
+        let worktree = Worktree::local(
+            Path::new(&message.path),
+            true,
+            self.fs.clone(),
+            next_entry_id,
+            &mut cx,
+        )
+        .await?;
+        self.state.update(&mut cx, |state, cx| {
+            state.worktrees.push(worktree.clone());
+            response.send(proto::AddWorktreeResponse {
+                worktree_id: worktree.read(cx).id().to_proto(),
+            });
+        })?;
         Ok(())
     }
 
