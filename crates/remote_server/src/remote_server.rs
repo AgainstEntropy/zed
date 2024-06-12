@@ -4,12 +4,8 @@ use fs::{Fs, RealFs};
 use futures::{channel::mpsc::UnboundedSender, future::LocalBoxFuture, Future, FutureExt as _};
 use gpui::{AppContext, AsyncAppContext, Context, Model};
 use remote::protocol::MessageId;
-use rpc::{
-    proto::{
-        self, AnyTypedEnvelope, Envelope, EnvelopedMessage as _, Error, PeerId, RequestMessage,
-    },
-    proto::{self, AnyTypedEnvelope, Envelope, EnvelopedMessage as _, Error, RequestMessage},
-    TypedEnvelope,
+use rpc::proto::{
+    self, AnyTypedEnvelope, Envelope, EnvelopedMessage as _, Error, RequestMessage, TypedEnvelope,
 };
 use smol::stream::StreamExt;
 use std::{

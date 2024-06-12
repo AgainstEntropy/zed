@@ -1,10 +1,7 @@
 use futures::channel::mpsc;
 use remote::protocol::{read_message, write_message};
 use remote_server::Server;
-use rpc::{
-    proto::{self, PeerId},
-    ConnectionId,
-};
+use rpc::proto::{self, PeerId};
 use smol::{io::AsyncWriteExt, stream::StreamExt as _, Async};
 use std::{env, io, time::Instant};
 
