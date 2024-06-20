@@ -328,11 +328,11 @@ pub enum Event {
     LanguageNotFound(Model<Buffer>),
     ActiveEntryChanged(Option<ProjectEntryId>),
     ActivateProjectPanel,
-    WorktreeAdded,
+    WorktreeAdded(WorktreeId),
     WorktreeOrderChanged,
     WorktreeRemoved(WorktreeId),
     WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
-    WorktreeUpdatedGitRepositories,
+    WorktreeUpdatedGitRepositories(WorktreeId),
     DiskBasedDiagnosticsStarted {
         language_server_id: LanguageServerId,
     },
@@ -7780,8 +7780,10 @@ impl Project {
     }
 
     fn add_worktree(&mut self, worktree: &Model<Worktree>, cx: &mut ModelContext<Self>) {
+        let worktree_id = worktree.update(cx, |worktree, _| worktree.id());
+
         cx.observe(worktree, |_, _, cx| cx.notify()).detach();
-        cx.subscribe(worktree, |this, worktree, event, cx| {
+        cx.subscribe(worktree, move |this, worktree, event, cx| {
             let is_local = worktree.read(cx).is_local();
             match event {
                 worktree::Event::UpdatedEntries(changes) => {
@@ -7797,7 +7799,6 @@ impl Project {
                         changes.clone(),
                     ));
 
-                    let worktree_id = worktree.update(cx, |worktree, _| worktree.id());
                     this.client()
                         .telemetry()
                         .report_discovered_project_events(worktree_id, changes);
@@ -7810,7 +7811,7 @@ impl Project {
                             cx,
                         )
                     }
-                    cx.emit(Event::WorktreeUpdatedGitRepositories);
+                    cx.emit(Event::WorktreeUpdatedGitRepositories(worktree_id));
                 }
             }
         })
@@ -7849,7 +7850,7 @@ impl Project {
         })
         .detach();
 
-        cx.emit(Event::WorktreeAdded);
+        cx.emit(Event::WorktreeAdded(worktree_id));
         self.metadata_changed(cx);
     }
 
