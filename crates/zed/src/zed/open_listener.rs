@@ -213,21 +213,19 @@ pub async fn open_ssh_paths(
     cx: &mut AsyncAppContext,
 ) -> Result<()> {
     for path in ssh_paths {
-        let Some(session) = remote::SshSession::new(
-            path.address,
-            &path.username,
-            &path.password,
-            cx.background_executor().clone(),
-        )
-        .await
-        .log_err() else {
+        let Some(session) =
+            remote::SshSession::new(path.address, &path.username, &path.password, cx)
+                .await
+                .log_err()
+        else {
             continue;
         };
 
         let fs = Arc::new(remote::RemoteFs::new(session.clone()));
         let project = cx.update(|cx| {
-            project::Project::local(
+            project::Project::ssh(
                 app_state.client.clone(),
+                session,
                 app_state.node_runtime.clone(),
                 app_state.user_store.clone(),
                 app_state.languages.clone(),
@@ -235,9 +233,9 @@ pub async fn open_ssh_paths(
                 cx,
             )
         })?;
+
         project
             .update(cx, |project, cx| {
-                project.set_ssh_session(session);
                 project.find_or_create_local_worktree(&path.path, true, cx)
             })?
             .await?;

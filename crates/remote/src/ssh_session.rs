@@ -7,14 +7,22 @@ use async_ssh2_lite::{AsyncSession, AsyncSessionStream};
 use collections::HashMap;
 use futures::{
     channel::{mpsc, oneshot},
-    AsyncWriteExt as _,
+    future::LocalBoxFuture,
+    AsyncWriteExt as _, Future,
 };
 use futures::{select_biased, AsyncReadExt as _, FutureExt as _, StreamExt as _};
-use gpui::BackgroundExecutor;
+use gpui::{AsyncAppContext, Model, WeakModel};
 use parking_lot::Mutex;
-use rpc::proto::{Envelope, EnvelopedMessage as _, RequestMessage};
+use rpc::{
+    proto::{
+        self, build_typed_envelope, AnyTypedEnvelope, Envelope, EnvelopedMessage, PeerId,
+        RequestMessage,
+    },
+    TypedEnvelope,
+};
 use smol::{fs::unix::MetadataExt, io, Async};
 use std::{
+    any::TypeId,
     net::{SocketAddr, TcpStream},
     path::Path,
     sync::{
@@ -24,15 +32,27 @@ use std::{
     time::Instant,
 };
 
-const SERVER_BINARY_LOCAL_PATH: &str = "target/release/remote_server";
+const SERVER_BINARY_LOCAL_PATH: &str = "target/debug/remote_server";
 const SERVER_BINARY_REMOTE_PATH: &str = "./.zed_remote_server";
 
-#[derive(Clone)]
 pub struct SshSession {
-    next_message_id: Arc<AtomicU32>,
-    response_channels: Arc<ResponseChannels>,
+    next_message_id: AtomicU32,
+    response_channels: ResponseChannels,
     outgoing_tx: mpsc::UnboundedSender<Envelope>,
     spawn_process_tx: mpsc::UnboundedSender<SpawnRequest>,
+    message_handlers: Mutex<
+        HashMap<
+            TypeId,
+            Arc<
+                dyn Send
+                    + Sync
+                    + Fn(
+                        Box<dyn AnyTypedEnvelope>,
+                        AsyncAppContext,
+                    ) -> Option<LocalBoxFuture<'static, Result<()>>>,
+            >,
+        >,
+    >,
 }
 
 type ResponseChannels = Mutex<HashMap<MessageId, mpsc::UnboundedSender<Envelope>>>;
@@ -42,12 +62,11 @@ impl SshSession {
         address: SocketAddr,
         user: &str,
         password: &str,
-        executor: BackgroundExecutor,
-    ) -> Result<Self> {
+        cx: &AsyncAppContext,
+    ) -> Result<Arc<Self>> {
         let (spawn_process_tx, mut spawn_process_rx) = mpsc::unbounded::<SpawnRequest>();
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
         let (incoming_tx, mut incoming_rx) = mpsc::unbounded::<Envelope>();
-        let response_channels = Arc::new(ResponseChannels::default());
 
         let stream = Async::<TcpStream>::connect(address)
             .await
@@ -67,165 +86,163 @@ impl SshSession {
         channel.exec(SERVER_BINARY_REMOTE_PATH).await?;
         let mut stderr = channel.stderr();
 
-        executor.spawn({
-            let executor = executor.clone();
-            async move {
-                let mut stdin_buffer = Vec::new();
-                let mut stdout_buffer = Vec::new();
-                let mut stderr_buffer = Vec::new();
-                let mut stderr_offset = 0;
+        let executor = cx.background_executor().clone();
+        executor.clone().spawn(async move {
+            let mut stdin_buffer = Vec::new();
+            let mut stdout_buffer = Vec::new();
+            let mut stderr_buffer = Vec::new();
+            let mut stderr_offset = 0;
 
-                loop {
-                    stdout_buffer.resize(MESSAGE_LEN_SIZE, 0);
-                    stderr_buffer.resize(stderr_offset + 1024, 0);
+            loop {
+                stdout_buffer.resize(MESSAGE_LEN_SIZE, 0);
+                stderr_buffer.resize(stderr_offset + 1024, 0);
 
-                    select_biased! {
-                        outgoing = outgoing_rx.next().fuse() => {
-                            let Some(outgoing) = outgoing else {
-                                return anyhow::Ok(());
-                            };
+                select_biased! {
+                    outgoing = outgoing_rx.next().fuse() => {
+                        let Some(outgoing) = outgoing else {
+                            return anyhow::Ok(());
+                        };
 
-                            log::info!("send message: {outgoing:?}");
-                            write_message(&mut channel, &mut stdin_buffer, outgoing).await?;
-                        }
+                        log::info!("send message: {outgoing:?}");
+                        write_message(&mut channel, &mut stdin_buffer, outgoing).await?;
+                    }
 
-                        request = spawn_process_rx.next().fuse() => {
-                            let Some(request) = request else {
-                                return Ok(());
-                            };
+                    request = spawn_process_rx.next().fuse() => {
+                        let Some(request) = request else {
+                            return Ok(());
+                        };
 
-                            log::info!("spawn process: {:?}", request.command);
-                            let mut channel = session
-                                .channel_session()
-                                .await
-                                .context("failed to create channel")?;
-                            channel.exec(&request.command).await?;
-                            let mut stderr = channel.stderr();
+                        log::info!("spawn process: {:?}", request.command);
+                        let mut channel = session
+                            .channel_session()
+                            .await
+                            .context("failed to create channel")?;
+                        channel.exec(&request.command).await?;
+                        let mut stderr = channel.stderr();
 
-                            let (stdin_tx, mut stdin_rx) = async_pipe::pipe();
-                            let (mut stdout_tx, stdout_rx) = async_pipe::pipe();
-                            let (mut stderr_tx, stderr_rx) = async_pipe::pipe();
-                            let (exit_tx, exit_rx) = oneshot::channel();
-                            request.process_tx.send(SshChildProcess {
-                                stdin: stdin_tx,
-                                stdout: stdout_rx,
-                                stderr: stderr_rx,
-                                exit: exit_rx,
-                            }).ok();
+                        let (stdin_tx, mut stdin_rx) = async_pipe::pipe();
+                        let (mut stdout_tx, stdout_rx) = async_pipe::pipe();
+                        let (mut stderr_tx, stderr_rx) = async_pipe::pipe();
+                        let (exit_tx, exit_rx) = oneshot::channel();
+                        request.process_tx.send(SshChildProcess {
+                            stdin: stdin_tx,
+                            stdout: stdout_rx,
+                            stderr: stderr_rx,
+                            exit: exit_rx,
+                        }).ok();
 
-                            executor.spawn(async move {
-                                let mut stdin_buffer = [0; 1024];
-                                let mut stdout_buffer = [0; 1024];
-                                let mut stderr_buffer = [0; 1024];
-                                loop {
-                                    select_biased! {
-                                        read = channel.read(&mut stdout_buffer).fuse() => {
-                                            match read {
-                                                Ok(len) => {
-                                                    if len == 0 {
-                                                        stdout_tx.close().ok();
-                                                        break;
-                                                    }
-                                                    stdout_tx.write_all(&stdout_buffer[..len]).await?;
+                        executor.spawn(async move {
+                            let mut stdin_buffer = [0; 1024];
+                            let mut stdout_buffer = [0; 1024];
+                            let mut stderr_buffer = [0; 1024];
+                            loop {
+                                select_biased! {
+                                    read = channel.read(&mut stdout_buffer).fuse() => {
+                                        match read {
+                                            Ok(len) => {
+                                                if len == 0 {
+                                                    stdout_tx.close().ok();
+                                                    break;
                                                 }
-                                                Err(error) => {
-                                                    log::error!("error reading stdout: {error:?}");
-                                                    break
-                                                }
+                                                stdout_tx.write_all(&stdout_buffer[..len]).await?;
                                             }
-                                        }
-                                        read = stderr.read(&mut stderr_buffer).fuse() => {
-                                            match read {
-                                                Ok(len) => {
-                                                    if len == 0 {
-                                                        stderr_tx.close().ok();
-                                                        break;
-                                                    }
-                                                    stderr_tx.write_all(&stderr_buffer[..len]).await?;
-                                                }
-                                                Err(error) => {
-                                                    log::error!("error reading stdout: {error:?}");
-                                                    break
-                                                }
-                                            }
-                                        }
-                                        read = stdin_rx.read(&mut stdin_buffer).fuse() => {
-                                            match read {
-                                                Ok(len) => {
-                                                    if len == 0 {
-                                                        channel.send_eof().await?;
-                                                        break;
-                                                    }
-                                                    channel.write_all(&stdin_buffer[..len]).await?;
-                                                }
-                                                Err(error) => {
-                                                    log::error!("error reading stdout: {error:?}");
-                                                    break
-                                                }
+                                            Err(error) => {
+                                                log::error!("error reading stdout: {error:?}");
+                                                break
                                             }
                                         }
                                     }
-                                }
-
-                                io::copy(&mut channel, &mut stdout_tx).await?;
-                                io::copy(&mut stderr, &mut stderr_tx).await?;
-                                if let Ok(status) = channel.exit_status() {
-                                    exit_tx.send(status).ok();
-                                }
-                                anyhow::Ok(())
-                            }).detach();
-                        }
-
-                        result = channel.read(&mut stdout_buffer).fuse() => {
-                            match result {
-                                Ok(len) => {
-                                    if len == 0 {
-                                        let status = channel.exit_status()?;
-                                        if status != 0 {
-                                            let signal = channel.exit_signal().await?;
-                                            log::info!("channel exited with status: {status:?}, signal: {:?}", signal.error_message);
-                                        }
-                                        return Ok(());
-                                    }
-
-                                    if len < stdout_buffer.len() {
-                                        channel.read_exact(&mut stdout_buffer[len..]).await?;
-                                    }
-
-                                    let message_len = message_len_from_buffer(&stdout_buffer);
-                                    match read_message_with_len(&mut channel, &mut stdout_buffer, message_len).await {
-                                        Ok(envelope) => {
-                                            log::info!("receive message: {envelope:?}");
-                                            incoming_tx.unbounded_send(envelope).ok();
-                                        }
-                                        Err(error) => {
-                                            log::error!("error decoding message {error:?}");
+                                    read = stderr.read(&mut stderr_buffer).fuse() => {
+                                        match read {
+                                            Ok(len) => {
+                                                if len == 0 {
+                                                    stderr_tx.close().ok();
+                                                    break;
+                                                }
+                                                stderr_tx.write_all(&stderr_buffer[..len]).await?;
+                                            }
+                                            Err(error) => {
+                                                log::error!("error reading stdout: {error:?}");
+                                                break
+                                            }
                                         }
                                     }
-                                }
-                                Err(error) => {
-                                    Err(anyhow!("error reading stdout: {error:?}"))?;
+                                    read = stdin_rx.read(&mut stdin_buffer).fuse() => {
+                                        match read {
+                                            Ok(len) => {
+                                                if len == 0 {
+                                                    channel.send_eof().await?;
+                                                    break;
+                                                }
+                                                channel.write_all(&stdin_buffer[..len]).await?;
+                                            }
+                                            Err(error) => {
+                                                log::error!("error reading stdout: {error:?}");
+                                                break
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                        }
 
-                        result = stderr.read(&mut stderr_buffer[stderr_offset..]).fuse() => {
-                            match result {
-                                Ok(len) => {
-                                    stderr_offset += len;
-                                    let mut start_ix = 0;
-                                    while let Some(ix) = stderr_buffer[start_ix..stderr_offset].iter().position(|b| b == &b'\n') {
-                                        let line_ix = start_ix + ix;
-                                        let content = String::from_utf8_lossy(&stderr_buffer[start_ix..line_ix]);
-                                        start_ix = line_ix + 1;
-                                        log::error!("stderr: {}", content);
+                            io::copy(&mut channel, &mut stdout_tx).await?;
+                            io::copy(&mut stderr, &mut stderr_tx).await?;
+                            if let Ok(status) = channel.exit_status() {
+                                exit_tx.send(status).ok();
+                            }
+                            anyhow::Ok(())
+                        }).detach();
+                    }
+
+                    result = channel.read(&mut stdout_buffer).fuse() => {
+                        match result {
+                            Ok(len) => {
+                                if len == 0 {
+                                    let status = channel.exit_status()?;
+                                    if status != 0 {
+                                        let signal = channel.exit_signal().await?;
+                                        log::info!("channel exited with status: {status:?}, signal: {:?}", signal.error_message);
                                     }
-                                    stderr_buffer.drain(0..start_ix);
-                                    stderr_offset -= start_ix;
+                                    return Ok(());
                                 }
-                                Err(error) => {
-                                    Err(anyhow!("error reading stderr: {error:?}"))?;
+
+                                if len < stdout_buffer.len() {
+                                    channel.read_exact(&mut stdout_buffer[len..]).await?;
                                 }
+
+                                let message_len = message_len_from_buffer(&stdout_buffer);
+                                match read_message_with_len(&mut channel, &mut stdout_buffer, message_len).await {
+                                    Ok(envelope) => {
+                                        log::info!("receive message: {envelope:?}");
+                                        incoming_tx.unbounded_send(envelope).ok();
+                                    }
+                                    Err(error) => {
+                                        log::error!("error decoding message {error:?}");
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                Err(anyhow!("error reading stdout: {error:?}"))?;
+                            }
+                        }
+                    }
+
+                    result = stderr.read(&mut stderr_buffer[stderr_offset..]).fuse() => {
+                        match result {
+                            Ok(len) => {
+                                stderr_offset += len;
+                                let mut start_ix = 0;
+                                while let Some(ix) = stderr_buffer[start_ix..stderr_offset].iter().position(|b| b == &b'\n') {
+                                    let line_ix = start_ix + ix;
+                                    let content = String::from_utf8_lossy(&stderr_buffer[start_ix..line_ix]);
+                                    start_ix = line_ix + 1;
+                                    log::error!("stderr: {}", content);
+                                }
+                                stderr_buffer.drain(0..start_ix);
+                                stderr_offset -= start_ix;
+                            }
+                            Err(error) => {
+                                Err(anyhow!("error reading stderr: {error:?}"))?;
                             }
                         }
                     }
@@ -233,45 +250,69 @@ impl SshSession {
             }
         }).detach();
 
-        executor
-            .spawn({
-                let response_channels = response_channels.clone();
-                async move {
-                    while let Some(incoming) = incoming_rx.next().await {
-                        if let Some(request_id) = incoming.responding_to {
-                            let request_id = MessageId(request_id);
-                            if incoming.payload.is_some() {
-                                if let Some(sender) = response_channels.lock().get(&request_id) {
-                                    sender.unbounded_send(incoming).ok();
-                                }
+        let this = Arc::new(Self {
+            next_message_id: AtomicU32::new(0),
+            response_channels: ResponseChannels::default(),
+            outgoing_tx,
+            spawn_process_tx,
+            message_handlers: Default::default(),
+        });
+
+        cx.spawn(|cx| {
+            let this = this.clone();
+            async move {
+                let peer_id = PeerId { owner_id: 0, id: 0 };
+                while let Some(incoming) = incoming_rx.next().await {
+                    if let Some(request_id) = incoming.responding_to {
+                        let request_id = MessageId(request_id);
+                        if incoming.payload.is_some() {
+                            if let Some(sender) = this.response_channels.lock().get(&request_id) {
+                                sender.unbounded_send(incoming).ok();
+                            }
+                        } else {
+                            this.response_channels.lock().remove(&request_id);
+                        }
+                    } else if let Some(envelope) =
+                        build_typed_envelope(peer_id, Instant::now(), incoming)
+                    {
+                        let type_id = envelope.payload_type_id();
+                        if let Some(handler) = this.message_handlers.lock().get(&type_id) {
+                            if let Some(future) = handler(envelope, cx.clone()) {
+                                future.await.ok();
                             } else {
-                                response_channels.lock().remove(&request_id);
+                                this.message_handlers.lock().remove(&type_id);
                             }
                         }
                     }
-                    anyhow::Ok(())
                 }
-            })
-            .detach();
-
-        Ok(Self {
-            next_message_id: Arc::new(AtomicU32::new(0)),
-            response_channels,
-            outgoing_tx,
-            spawn_process_tx,
+                anyhow::Ok(())
+            }
         })
+        .detach();
+
+        Ok(this)
     }
 
     pub async fn request<T: RequestMessage>(&self, payload: T) -> Result<T::Response> {
-        let id = self.next_message_id.fetch_add(1, SeqCst);
-        let (tx, mut rx) = mpsc::unbounded();
-        self.response_channels.lock().insert(MessageId(id), tx);
-        self.outgoing_tx
-            .unbounded_send(payload.into_envelope(id, None, None))
-            .ok();
-        let response = rx.next().await.ok_or_else(|| anyhow!("connection lost"))?;
+        let response = self
+            .request_dynamic(payload.into_envelope(0, None, None), "")
+            .await?;
         T::Response::from_envelope(response)
             .ok_or_else(|| anyhow!("received a response of the wrong type"))
+    }
+
+    pub fn request_dynamic(
+        &self,
+        mut envelope: proto::Envelope,
+        _request_type: &'static str,
+    ) -> impl Future<Output = Result<proto::Envelope>> {
+        envelope.id = self.next_message_id.fetch_add(1, SeqCst);
+        let (tx, mut rx) = mpsc::unbounded();
+        self.response_channels
+            .lock()
+            .insert(MessageId(envelope.id), tx);
+        self.outgoing_tx.unbounded_send(envelope).ok();
+        async move { rx.next().await.ok_or_else(|| anyhow!("connection lost")) }
     }
 
     pub async fn spawn_process(&self, command: String) -> SshChildProcess {
@@ -283,6 +324,24 @@ impl SshSession {
             })
             .ok();
         process_rx.await.unwrap()
+    }
+
+    pub fn add_message_handler<M, E, H, F>(&self, entity: WeakModel<E>, handler: H)
+    where
+        M: EnvelopedMessage,
+        E: 'static,
+        H: 'static + Sync + Send + Fn(Model<E>, TypedEnvelope<M>, AsyncAppContext) -> F,
+        F: 'static + Future<Output = Result<()>>,
+    {
+        let message_type_id = TypeId::of::<M>();
+        self.message_handlers.lock().insert(
+            message_type_id,
+            Arc::new(move |envelope, cx| {
+                let entity = entity.upgrade()?;
+                let envelope = envelope.into_any().downcast::<TypedEnvelope<M>>().unwrap();
+                Some(handler(entity, *envelope, cx).boxed_local())
+            }),
+        );
     }
 }
 

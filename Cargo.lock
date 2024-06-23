@@ -8522,6 +8522,7 @@ dependencies = [
  "log",
  "remote",
  "rpc",
+ "settings",
  "smol",
  "text",
  "worktree",

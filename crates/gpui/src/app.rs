@@ -147,8 +147,10 @@ impl App {
         let headless = self.0.borrow().headless;
         let platform = self.0.borrow().platform.clone();
         if headless {
-            let cx = &mut *this.borrow_mut();
-            on_finish_launching(cx);
+            {
+                let cx = &mut *this.borrow_mut();
+                on_finish_launching(cx);
+            }
             platform.run_headless();
         } else {
             platform.run(Box::new(move || {

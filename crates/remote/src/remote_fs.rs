@@ -19,13 +19,13 @@ use std::{
 use text::{LineEnding, Rope};
 
 pub struct RemoteFs {
-    session: SshSession,
+    session: Arc<SshSession>,
 }
 
 struct RemoteWatcher {}
 
 impl RemoteFs {
-    pub fn new(session: SshSession) -> Self {
+    pub fn new(session: Arc<SshSession>) -> Self {
         Self { session }
     }
 }

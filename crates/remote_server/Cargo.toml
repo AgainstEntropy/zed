@@ -30,6 +30,7 @@ gpui.workspace = true
 log.workspace = true
 remote.workspace = true
 rpc.workspace = true
+settings.workspace = true
 smol.workspace = true
 text.workspace = true
 worktree.workspace = true

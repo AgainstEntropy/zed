@@ -7,6 +7,7 @@ use remote::protocol::MessageId;
 use rpc::proto::{
     self, AnyTypedEnvelope, Envelope, EnvelopedMessage as _, Error, RequestMessage, TypedEnvelope,
 };
+use settings::{Settings, SettingsStore};
 use smol::stream::StreamExt;
 use std::{
     any::TypeId,
@@ -16,7 +17,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 use text::LineEnding;
-use worktree::Worktree;
+use worktree::{Worktree, WorktreeSettings};
 
 #[derive(Clone)]
 pub struct Server {
@@ -55,9 +56,14 @@ struct ResponseInner {
 }
 
 impl Server {
+    pub fn init(cx: &mut AppContext) {
+        cx.set_global(SettingsStore::default());
+        WorktreeSettings::register(cx);
+    }
+
     pub fn new(cx: &mut AppContext) -> Self {
         let handlers = unsafe {
-            INIT_HANDLERS.call_once(|| HANDLERS = Some(Self::init()));
+            INIT_HANDLERS.call_once(|| HANDLERS = Some(Self::build_handlers()));
             HANDLERS.as_ref().unwrap()
         };
 
@@ -71,7 +77,7 @@ impl Server {
         }
     }
 
-    fn init() -> Handlers {
+    fn build_handlers() -> Handlers {
         Handlers(HashMap::default())
             .add(Self::ping)
             .add(Self::write_file)
@@ -123,7 +129,14 @@ impl Server {
             &mut cx,
         )
         .await?;
+        let sender = response.0.clone();
         self.state.update(&mut cx, |state, cx| {
+            worktree.update(cx, |worktree, cx| {
+                worktree.observe_updates(0, cx, move |update| {
+                    sender.send(update.into_envelope(0, None, None));
+                    futures::future::ready(true)
+                })
+            });
             state.worktrees.push(worktree.clone());
             response.send(proto::AddWorktreeResponse {
                 worktree_id: worktree.read(cx).id().to_proto(),
